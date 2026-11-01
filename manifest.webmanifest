@@ -1,0 +1,25 @@
+{
+  "name": "Capture",
+  "short_name": "Capture",
+  "description": "Keep anything you want to learn. Claude explains it and hands back a few a day.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#ECEFF3",
+  "theme_color": "#1C2330",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ],
+  "shortcuts": [
+    {"name": "Keep something", "short_name": "Keep", "url": "./?add=1", "icons": [{"src": "icon-192.png", "sizes": "192x192", "type": "image/png"}]}
+  ],
+  "share_target": {
+    "action": "./",
+    "method": "GET",
+    "params": {"title": "title", "text": "text", "url": "url"}
+  }
+}

@@ -980,6 +980,7 @@ function settingsHTML() {
       <label>Your data</label>
       <span class="help">Everything lives on this phone. Export it now and then as a backup.</span>
       <div class="inrow"><button class="btn line" data-a="export" type="button">Export as a file</button>${installPrompt ? `<button class="btn line" data-a="install" type="button">Install on home screen</button>` : ''}</div>
+      ${!installPrompt && !isStandalone() ? `<span class="help">To install: open this page in Chrome, tap ⋮ at the top right, then <b>Add to Home screen</b> (or <b>Install app</b>).</span>` : ''}
     </div>
   </div>`;
 }
@@ -1220,7 +1221,7 @@ document.addEventListener('click', (e) => {
     }
     case 'defmodel': settings.chatModel = t.dataset.m; setKV('settings', settings); delete $('#sheetBody').dataset.settings; render(); return;
     case 'export': return exportData();
-    case 'install': if (installPrompt) { installPrompt.prompt(); installPrompt = null; } return;
+    case 'install': if (installPrompt) { const ip = installPrompt; ip.prompt(); ip.userChoice.finally(() => { installPrompt = null; if ($('#bannerBtn').dataset.a === 'install') clearBanner(); render(); }); } return;
     case 'console': window.open('https://platform.claude.com/', '_blank', 'noopener'); return;
     default: if (id) act(id, a);
   }
@@ -1230,7 +1231,13 @@ $('#sheet').addEventListener('click', (e) => { if (e.target.id === 'sheet') { cl
 document.addEventListener('visibilitychange', () => { if (!document.hidden && loaded) { render(); maybeFillDrop(); pump(); } });
 window.addEventListener('online', () => { pausedUntil = 0; pump(); });
 let installPrompt = null;
-window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; });
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+// Chrome's own install prompt is held back, so offer it visibly instead of only inside Settings
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault(); installPrompt = e;
+  if (!isStandalone() && $('#banner').hidden) setBanner('Install Capture on your home screen. It opens like an app and works offline.', 'Install', 'install');
+});
+window.addEventListener('appinstalled', () => { installPrompt = null; if ($('#bannerBtn').dataset.a === 'install') clearBanner(); });
 
 /* ---------------- boot ---------------- */
 render();

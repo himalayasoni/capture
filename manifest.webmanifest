@@ -2,7 +2,7 @@
   "name": "Capture",
   "short_name": "Capture",
   "description": "Keep anything you want to learn. It gets explained and handed back a few a day.",
-  "id": "./",
+  "id": "/capture/",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

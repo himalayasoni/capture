@@ -1,5 +1,5 @@
 // Capture service worker: keeps the app usable offline.
-const VERSION = 'capture-v2';
+const VERSION = 'capture-v3';
 const RUNTIME = 'capture-runtime';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 

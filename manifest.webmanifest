@@ -1,7 +1,7 @@
 {
   "name": "Capture",
   "short_name": "Capture",
-  "description": "Keep anything you want to learn. Claude explains it and hands back a few a day.",
+  "description": "Keep anything you want to learn. It gets explained and handed back a few a day.",
   "id": "./",
   "start_url": "./",
   "scope": "./",

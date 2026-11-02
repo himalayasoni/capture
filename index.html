@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Capture</title>
-<meta name="description" content="Keep anything you want to learn. Claude explains it and hands back a few a day.">
+<meta name="description" content="Keep anything you want to learn. It gets explained and handed back a few a day.">
 <meta name="theme-color" content="#ECEFF3" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#11151C" media="(prefers-color-scheme: dark)">
 <link rel="manifest" href="manifest.webmanifest">
@@ -245,8 +245,8 @@ hr.sep{border:0;border-top:1px solid var(--line);margin:4px 0}
 
   <main id="view-today">
     <div id="setup" class="setup" hidden>
-      <h3>Connect Claude to get things explained</h3>
-      <p>You can keep things right away. They'll be explained as soon as you add your Claude API key, which takes about two minutes.</p>
+      <h3 id="setupTitle">Connect Gemini to get things explained</h3>
+      <p id="setupText">You can keep things right away. They'll be explained as soon as you add your free Gemini API key, which takes about two minutes.</p>
       <button class="btn lamp" data-a="settings">Add my key</button>
     </div>
     <form class="well" id="captureForm" autocomplete="off">
@@ -336,6 +336,11 @@ const MODELS = {
 const SEARCH_PRICE = 0.01; // $10 per 1,000 searches
 const SEARCH_TYPES = ['web_search_20250305', 'web_search_20260209'];
 
+/* ---------------- Gemini API (free tier) ---------------- */
+const GEMINI = 'https://generativelanguage.googleapis.com/v1beta';
+const GEMINI_FALLBACK = {flash:'gemini-flash-latest', lite:'gemini-flash-lite-latest'};
+const gBenched = {}; // model -> time it may be tried again (its daily quota ran out)
+
 /* ---------------- storage (IndexedDB) ---------------- */
 let idb = null;
 function openDB() {
@@ -363,7 +368,11 @@ function storageErr(e) { console.warn(e); toast("Couldn't save on this phone. Is
 /* ---------------- state ---------------- */
 const items = new Map();
 let meta = {dropDate:'', dropIds:[]};
-let settings = {apiKey:'', cap:3, chatModel:'haiku', searchCards:true};
+let settings = {provider:'gemini', geminiKey:'', gModels:null, geminiSearch:true, apiKey:'', cap:3, chatModel:'haiku', searchCards:true};
+let usage = {day:'', counts:{}};
+const isGemini = () => settings.provider !== 'claude';
+const hasKey = () => isGemini() ? !!settings.geminiKey : !!settings.apiKey;
+const aiName = () => isGemini() ? 'Gemini' : 'Claude';
 let spend = {month:monthKey(Date.now()), usd:0, calls:0, searches:0};
 let fresh = [];
 const open = new Set();
@@ -438,21 +447,128 @@ async function callClaude({model, system, messages, maxTokens, search}) {
   return {text:text.trim(), sources:sources.slice(0, 6)};
 }
 
+/* Gemini: free daily quotas reset at midnight Pacific time */
+function quotaResetAt() {
+  try {
+    const now = new Date();
+    const la = new Date(now.toLocaleString('en-US', {timeZone:'America/Los_Angeles'}));
+    const next = new Date(la); next.setHours(24, 0, 0, 0);
+    return now.getTime() + (next - la);
+  } catch { return Date.now() + 60 * 60000; }
+}
+function rollUsage() { if (usage.day !== today()) usage = {day:today(), counts:{}}; }
+function countUse(label) { rollUsage(); usage.counts[label] = (usage.counts[label] || 0) + 1; setKV('usage', usage); }
+
+async function gFetch(path, opts = {}) {
+  let res, data;
+  try {
+    res = await fetch(GEMINI + path, {...opts, headers:{'content-type':'application/json', 'x-goog-api-key':settings.geminiKey}});
+    data = await res.json().catch(() => ({}));
+  } catch { throw {code:'offline'}; }
+  if (!res.ok) {
+    const msg = data?.error?.message || ('HTTP ' + res.status);
+    const raw = JSON.stringify(data?.error || {});
+    const http = res.status;
+    if ((http === 400 && /api key/i.test(msg)) || http === 401 || http === 403) throw {code:'bad_key', msg, http};
+    if (http === 429) throw {code:/PerDay|per day|daily/i.test(raw) ? 'quota_day' : 'rate', msg, http};
+    if (http === 404) throw {code:'no_model', msg, http};
+    if (http >= 500) throw {code:'busy', msg, http};
+    throw {code:'api', msg, http};
+  }
+  return data;
+}
+async function discoverGemini() {
+  const data = await gFetch('/models?pageSize=1000', {method:'GET'});
+  const re = /^gemini-(\d+(?:\.\d+)?)-flash(-lite)?(-preview(?:-[\w-]+)?)?$/;
+  const found = [];
+  for (const m of data.models || []) {
+    const n = String(m.name || '').replace(/^models\//, '');
+    if (!(m.supportedGenerationMethods || []).includes('generateContent')) continue;
+    const r = n.match(re);
+    if (r) found.push({n, v:parseFloat(r[1]), lite:!!r[2], pre:!!r[3]});
+  }
+  const best = (lite) => found.filter((x) => x.lite === lite).sort((a, b) => (a.pre - b.pre) || (b.v - a.v))[0]?.n;
+  return {flash:best(false) || GEMINI_FALLBACK.flash, lite:best(true) || GEMINI_FALLBACK.lite};
+}
+async function callGemini({system, messages, json, search}) {
+  if (!settings.geminiKey) throw {code:'no_key'};
+  const gm = settings.gModels || GEMINI_FALLBACK;
+  let lastErr = null;
+  for (const [label, model] of [['Flash', gm.flash], ['Flash-Lite', gm.lite]]) {
+    if ((gBenched[model] || 0) > Date.now()) { lastErr = {code:'quota_day'}; continue; }
+    let useSearch = !!search && settings.geminiSearch;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const body = {contents:messages.map((m) => ({role:m.role === 'assistant' ? 'model' : 'user', parts:[{text:m.content}]}))};
+      if (system) body.systemInstruction = {parts:[{text:system}]};
+      if (json) body.generationConfig = {responseMimeType:'application/json'};
+      if (useSearch) body.tools = [{google_search:{}}];
+      try {
+        const data = await gFetch(`/models/${encodeURIComponent(model)}:generateContent`, {method:'POST', body:JSON.stringify(body)});
+        countUse(label);
+        const cand = data.candidates?.[0];
+        const text = (cand?.content?.parts || []).filter((p) => p.text && !p.thought).map((p) => p.text).join('').trim();
+        if (!text) {
+          if (data.promptFeedback?.blockReason || ['SAFETY','PROHIBITED_CONTENT','BLOCKLIST','RECITATION'].includes(cand?.finishReason)) throw {code:'blocked'};
+          throw {code:'api', msg:'An empty answer came back.'};
+        }
+        const sources = [];
+        for (const ch of cand.groundingMetadata?.groundingChunks || []) {
+          const w = ch.web;
+          if (w?.uri && !sources.some((s) => s.url === w.uri)) sources.push({url:w.uri, title:w.title || w.uri});
+        }
+        return {text, sources:sources.slice(0, 6), by:'Gemini ' + label};
+      } catch (e) {
+        lastErr = e;
+        // The free tier often refuses Google Search: switch it off and answer without it.
+        if (useSearch && e.code !== 'offline' && e.code !== 'blocked' && !/api key/i.test(e.msg || '') &&
+            (e.http === 400 || e.http === 403 || /search|ground/i.test(e.msg || ''))) {
+          useSearch = false; settings.geminiSearch = false; setKV('settings', settings);
+          toast("Google Search isn't available on the free tier, so Gemini will answer from what it knows.");
+          continue;
+        }
+        if (['rate','quota_day','no_model','busy'].includes(e.code)) {
+          if (e.code === 'quota_day') gBenched[model] = quotaResetAt();
+          break; // try the next model
+        }
+        throw e;
+      }
+    }
+  }
+  throw lastErr || {code:'api'};
+}
+async function callAI({system, messages, json, search, model, maxTokens}) {
+  if (isGemini()) return callGemini({system, messages, json, search});
+  const m = model || 'haiku';
+  const r = await callClaude({model:m, system, messages, maxTokens, search:search || 0});
+  return {...r, by:MODELS[m].name};
+}
+
 function explainError(e) {
   switch (e?.code) {
-    case 'no_key': return 'Add your Claude API key in Settings to get things explained.';
-    case 'bad_key': return "Your Claude API key didn't work. Check it in Settings.";
+    case 'no_key': return `Add your ${aiName()} API key in Settings to get things explained.`;
+    case 'bad_key': return `Your ${aiName()} API key didn't work. Check it in Settings.`;
     case 'no_credit': return 'Your Claude credits have run out. Top up in the Claude Console and things will continue.';
     case 'cap': return `You've reached this month's limit of ${usd(settings.cap)}. Raise it in Settings, or continue in the Claude app.`;
     case 'offline': return "You're offline. Things you keep are saved and will be explained when you're back online.";
-    case 'rate': case 'busy': return 'Claude is busy right now. Your things are saved; they will be explained a bit later.';
-    default: return 'Something went wrong talking to Claude' + (e?.msg ? ': ' + e.msg : '.');
+    case 'quota_day': return `You've used today's free Gemini requests. Your things are saved and will be explained after the quota resets at ${new Date(quotaResetAt()).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}.`;
+    case 'rate': return isGemini() ? 'Too many requests in one minute for the free tier. Capture will carry on by itself shortly.' : 'Claude is busy right now. Your things are saved; they will be explained a bit later.';
+    case 'busy': return `${aiName()} is busy right now. Your things are saved; they will be explained a bit later.`;
+    case 'blocked': return `${aiName()} wouldn't answer this one. Try wording it differently.`;
+    case 'no_model': return "Gemini couldn't find its model. Open Settings and tap Save & test again.";
+    default: return `Something went wrong talking to ${aiName()}` + (e?.msg ? ': ' + e.msg : '.');
   }
 }
+let resumeT;
 function handleBlocking(e) {
   const c = e?.code;
   if (['no_key','bad_key','no_credit','cap'].includes(c)) { blocked = c; setBanner(explainError(e), c === 'no_credit' ? 'Open Console' : 'Settings', c === 'no_credit' ? 'console' : 'settings'); return true; }
-  if (['offline','rate','busy'].includes(c)) { pausedUntil = Date.now() + (c === 'offline' ? 0 : 5 * 60000); if (c !== 'offline') setBanner(explainError(e)); return true; }
+  if (['offline','rate','busy','quota_day'].includes(c)) {
+    pausedUntil = c === 'offline' ? 0 : c === 'quota_day' ? quotaResetAt() : Date.now() + (c === 'rate' && isGemini() ? 65000 : 5 * 60000);
+    if (c !== 'offline') setBanner(explainError(e));
+    clearTimeout(resumeT);
+    if (pausedUntil) resumeT = setTimeout(() => { clearBanner(); pump(); }, Math.min(pausedUntil - Date.now() + 1000, 2147000000));
+    return true;
+  }
   return false;
 }
 
@@ -462,12 +578,12 @@ function cardPrompt(it, cats) {
 Where it came up (may be empty): """${it.ctx || ''}"""
 Categories already on my shelf: ${cats.length ? cats.join(', ') : '(none yet)'}`;
 }
-const CARD_SYSTEM = `You prepare one small learning card for a curious person in India. They jot things down when they hear them (a word, a topic, something in the news, a product, a life situation) and want them explained so they can learn without searching. Write in plain, friendly English with simple words; they are also improving their English, so briefly explain any hard word you must use. Be accurate and specific. No filler, no greetings.
+const cardSystem = (canSearch) => `You prepare one small learning card for a curious person in India. They jot things down when they hear them (a word, a topic, something in the news, a product, a life situation) and want them explained so they can learn without searching. Write in plain, friendly English with simple words; they are also improving their English, so briefly explain any hard word you must use. Be accurate and specific. No filler, no greetings.
 
 Decide what the jotted thing is. "kind" is one of: word, phrase, concept, tech, news, product, place, person, how-to, life, other.
 Pick a shelf "category" of 1-2 words in Title Case (like Words, Tech, Money, Health, Work, Science, Shopping, World, Life). Reuse an existing category when one fits.
 If the text is unclear or misspelled, go with the most likely meaning and use the corrected name as the title.
-Use web search only when the thing is about recent news, current prices or products, or something you don't recognise. For ordinary words and concepts, don't search. Give prices in Indian rupees.
+${canSearch ? "Use web search only when the thing is about recent news, current prices or products, or something you don't recognise. For ordinary words and concepts, don't search." : 'If it involves recent news or prices, give what you know and say roughly how current that is.'} Give prices in Indian rupees.
 Match depth to the thing: a simple everyday word gets a short "deep"; a big topic gets a fuller one.
 
 Reply with only one JSON object, no other text:
@@ -490,7 +606,7 @@ let pumping = false;
 const inflight = new Set();
 async function pump() {
   if (pumping || blocked || Date.now() < pausedUntil || !navigator.onLine) return;
-  if (!settings.apiKey) { blocked = 'no_key'; render(); return; }
+  if (!hasKey()) { blocked = 'no_key'; render(); return; }
   pumping = true;
   try {
     for (;;) {
@@ -507,16 +623,18 @@ async function pump() {
 async function generate(it) {
   const cats = [...new Set(all().map((i) => i.category).filter(Boolean))].slice(0, 30);
   try {
-    let card, sources = [];
+    let card, sources = [], by = '';
+    const canSearch = !isGemini() && settings.searchCards;
+    const base = {system:cardSystem(canSearch), json:true, maxTokens:1800};
     try {
-      const r = await callClaude({model:'haiku', system:CARD_SYSTEM, messages:[{role:'user', content:cardPrompt(it, cats)}], maxTokens:1800, search:settings.searchCards ? 2 : 0});
-      card = parseCard(r.text, it.q); sources = r.sources;
+      const r = await callAI({...base, messages:[{role:'user', content:cardPrompt(it, cats)}], search:canSearch ? 2 : 0});
+      card = parseCard(r.text, it.q); sources = r.sources; by = r.by;
     } catch (e) {
       if (e?.code !== 'bad_json') throw e;
-      const r = await callClaude({model:'haiku', system:CARD_SYSTEM, messages:[{role:'user', content:cardPrompt(it, cats) + '\n\nReply with the JSON object only.'}], maxTokens:1800, search:0});
-      card = parseCard(r.text, it.q);
+      const r = await callAI({...base, messages:[{role:'user', content:cardPrompt(it, cats) + '\n\nReply with the JSON object only.'}], search:0});
+      card = parseCard(r.text, it.q); by = r.by;
     }
-    Object.assign(it, {status:'ready', readyAt:Date.now(), title:card.title, category:card.category, type:card.kind, card, sources, err:null});
+    Object.assign(it, {status:'ready', readyAt:Date.now(), title:card.title, category:card.category, type:card.kind, card, sources, by, err:null});
     await putItem(it);
     if (blocked === null) clearBanner();
     return true;
@@ -609,7 +727,7 @@ function speak(id) {
 /* chat */
 function chatSystem(it) {
   const c = it.card || {};
-  return `You're a friendly explainer inside a personal learning app. The person is learning about "${c.title || it.q}". Their card says: ${c.oneLiner || ''}\n\n${c.gist || ''}\n\nAnswer their questions in plain, simple English (they are improving their English too). Keep answers short, under 150 words, unless they ask for more. Use short paragraphs, and "- " lines for lists. Use web search when the question needs current or recent information (news, prices, latest versions); otherwise answer from what you know. Today is ${new Date().toDateString()}.`;
+  return `You're a friendly explainer inside a personal learning app. The person is learning about "${c.title || it.q}". Their card says: ${c.oneLiner || ''}\n\n${c.gist || ''}\n\nAnswer their questions in plain, simple English (they are improving their English too). Keep answers short, under 150 words, unless they ask for more. Use short paragraphs, and "- " lines for lists. ${(!isGemini() || settings.geminiSearch) ? 'Use web search when the question needs current or recent information (news, prices, latest versions); otherwise answer from what you know.' : 'If the question needs very recent information, give what you know and say how current it is.'} Today is ${new Date().toDateString()}.`;
 }
 async function sendChat(id, text, model) {
   const it = items.get(id);
@@ -620,11 +738,11 @@ async function sendChat(id, text, model) {
   const msgs = it.chat.slice(-12).map((m) => ({role:m.role, content:m.text}));
   while (msgs.length && msgs[0].role !== 'user') msgs.shift();
   try {
-    const r = await callClaude({model, system:chatSystem(it), messages:msgs, maxTokens:model === 'sonnet' ? 1200 : 900, search:3});
-    it.chat.push({role:'assistant', text:r.text || '(No answer came back.)', sources:r.sources, model, at:Date.now()});
+    const r = await callAI({model, system:chatSystem(it), messages:msgs, maxTokens:model === 'sonnet' ? 1200 : 900, search:3});
+    it.chat.push({role:'assistant', text:r.text || '(No answer came back.)', sources:r.sources, model, by:r.by, at:Date.now()});
   } catch (e) {
     it.chat.push({role:'assistant', text:explainError(e), error:true, at:Date.now()});
-    if (['no_key','bad_key','no_credit','cap'].includes(e?.code)) handleBlocking(e);
+    if (['no_key','bad_key','no_credit','cap','quota_day'].includes(e?.code)) handleBlocking(e);
   }
   chatBusy.delete(id);
   putItem(it); render();
@@ -691,10 +809,10 @@ function cardHTML(it, where) {
   const id = it.id;
   if (it.status !== 'ready') {
     const failed = it.status === 'failed';
-    const waitingKey = !failed && !settings.apiKey;
+    const waitingKey = !failed && !hasKey();
     return `<div class="cmeta"><span>${failed ? "Couldn't prepare" : 'Getting ready'}</span></div>
       <h3 class="ttl">${esc(it.q)}</h3>
-      <p class="one muted">${failed ? esc(it.err || 'Something went wrong while explaining this.') : waitingKey ? 'Saved. It will be explained once your Claude key is added.' : 'Claude is writing this up. It will be here in a minute.'}</p>
+      <p class="one muted">${failed ? esc(it.err || 'Something went wrong while explaining this.') : waitingKey ? `Saved. It will be explained once your ${aiName()} key is added.` : `${aiName()} is writing this up. It will be here in a minute.`}</p>
       <div class="acts">${failed ? `<button class="btn" data-a="retry" data-id="${id}">Try again</button>` : ''}<span class="spacer"></span><button class="ghost" data-a="forget" data-id="${id}">Delete</button></div>`;
   }
   const g = open.has(id + ':g'), d = open.has(id + ':d'), t = open.has(id + ':t');
@@ -723,24 +841,29 @@ function chatHTML(it) {
   const busy = chatBusy.has(id);
   const msgs = (it.chat || []).map((m) => m.role === 'user'
     ? `<div class="msg me">${esc(m.text)}</div>`
-    : `<div class="msg ai">${prose(m.text)}${sourcesHTML(m.sources)}${m.model ? `<span class="by">${esc(MODELS[m.model]?.name || '')}</span>` : ''}</div>`).join('');
+    : `<div class="msg ai">${prose(m.text)}${sourcesHTML(m.sources)}${(m.by || m.model) ? `<span class="by">${esc(m.by || MODELS[m.model]?.name || '')}</span>` : ''}</div>`).join('');
+  const g = isGemini();
+  const searching = !g || settings.geminiSearch;
+  const foot = g
+    ? (settings.geminiSearch ? 'Gemini, free. Searches Google when it needs to.' : 'Gemini, free. Answers from what it knows; for the very latest, continue in Claude.')
+    : (model === 'sonnet' ? 'Sonnet: richer answers, about 5¢ a question.' : 'Haiku: quick and very cheap.');
   return `<div class="chat">
     <div class="chathead"><span class="eyebrow">Ask about it</span>
-      <div class="seg" role="group" aria-label="Model">
+      ${g ? '' : `<div class="seg" role="group" aria-label="Model">
         <button data-a="model" data-m="haiku" data-id="${id}" aria-pressed="${model === 'haiku'}">Haiku</button>
         <button data-a="model" data-m="sonnet" data-id="${id}" aria-pressed="${model === 'sonnet'}">Sonnet</button>
-      </div></div>
-    <div class="msgs">${msgs || `<p class="muted" style="margin:0;font-size:14.5px">Ask anything: what's the latest, how it's used, an example from real life. Claude searches the web when it needs fresh information.</p>`}
+      </div>`}</div>
+    <div class="msgs">${msgs || `<p class="muted" style="margin:0;font-size:14.5px">Ask anything: how it's used, an example from real life, what's new with it.${searching ? ` ${aiName()} searches the web when it needs fresh information.` : ''}</p>`}
       ${busy ? `<div class="msg ai"><span class="waiting" style="padding:0"><span class="glow"></span>Thinking…</span></div>` : ''}</div>
     <form class="chatbox" data-chat="${id}"><textarea id="chat-${id}" rows="1" placeholder="Ask a question…" ${busy ? 'disabled' : ''}></textarea><button class="btn lamp" type="submit" ${busy ? 'disabled' : ''}>Ask</button></form>
-    <div class="chatfoot" id="chatEnd"><span>${model === 'sonnet' ? 'Sonnet: richer answers, about 5¢ a question.' : 'Haiku: quick and very cheap.'}</span><span class="spacer"></span><button class="linkbtn" data-a="continue" data-id="${id}">Continue in Claude</button></div>
+    <div class="chatfoot" id="chatEnd"><span>${foot}</span><span class="spacer"></span><button class="linkbtn" data-a="continue" data-id="${id}">Continue in Claude</button></div>
   </div>`;
 }
 
 function renderFresh() {
   const ids = dropIds();
   $('#fresh').innerHTML = fresh.map((id) => items.get(id)).filter((i) => i && !handledToday(i)).slice(0, 3).map((i) => {
-    if (i.status === 'brewing') return `<div class="frow"><span class="glow ${settings.apiKey && !blocked ? '' : 'off'}"></span><span class="ftext">${settings.apiKey && !blocked ? `Getting <strong>${esc(i.q)}</strong> ready…` : `<strong>${esc(i.q)}</strong> is saved, waiting for Claude.`}</span></div>`;
+    if (i.status === 'brewing') { const live = hasKey() && !blocked && Date.now() >= pausedUntil; return `<div class="frow"><span class="glow ${live ? '' : 'off'}"></span><span class="ftext">${live ? `Getting <strong>${esc(i.q)}</strong> ready…` : `<strong>${esc(i.q)}</strong> is saved, waiting for ${aiName()}.`}</span></div>`; }
     if (i.status === 'failed') return `<div class="frow"><span class="glow off"></span><span class="ftext">Couldn't prepare <strong>${esc(i.q)}</strong>.</span><button class="linkbtn" data-a="retry" data-id="${i.id}">Try again</button></div>`;
     if (ids.includes(i.id)) return `<div class="frow"><span class="glow still"></span><span class="ftext"><strong>${esc(i.title || i.q)}</strong> is ready, below in today's list.</span></div>`;
     return `<div class="frow"><span class="glow still"></span><span class="ftext"><strong>${esc(i.title || i.q)}</strong> is ready.</span><button class="linkbtn" data-a="open" data-id="${i.id}">Peek now</button></div>`;
@@ -748,7 +871,11 @@ function renderFresh() {
 }
 
 function renderToday() {
-  $('#setup').hidden = !!settings.apiKey || !loaded;
+  $('#setup').hidden = hasKey() || !loaded;
+  $('#setupTitle').textContent = `Connect ${aiName()} to get things explained`;
+  $('#setupText').textContent = isGemini()
+    ? "You can keep things right away. They'll be explained as soon as you add your free Gemini API key, which takes about two minutes."
+    : "You can keep things right away. They'll be explained as soon as you add your Claude API key.";
   const list = $('#dropList'), sub = $('#todaySub');
   if (!loaded) { list.innerHTML = `<div class="waiting"><span class="glow"></span>Opening your jar…</div>`; return; }
   const its = dropIds().map((id) => items.get(id)).filter(Boolean);
@@ -757,7 +884,7 @@ function renderToday() {
     sub.textContent = '';
     const brewing = all().some((i) => i.status === 'brewing');
     if (!items.size) list.innerHTML = `<div class="empty"><h3>Nothing here yet, and that's fine.</h3>When a word or topic catches your ear, drop it in above. Each day, up to three come back to you here, already explained in a line, a minute, or more if you want it.</div>`;
-    else if (brewing && settings.apiKey) list.innerHTML = `<div class="waiting"><span class="glow"></span>Getting your things ready…</div>`;
+    else if (brewing && hasKey()) list.innerHTML = `<div class="waiting"><span class="glow"></span>Getting your things ready…</div>`;
     else list.innerHTML = `<div class="empty"><h3>Nothing waiting today.</h3>Enjoy the quiet. Anything you keep will show up here.</div>`;
     return;
   }
@@ -836,10 +963,65 @@ function renderShelf() {
 }
 
 function settingsHTML() {
+  const g = isGemini();
+  return `<div class="form">
+    <div class="field">
+      <label>AI that explains things</label>
+      <div class="seg" role="group" aria-label="AI provider">
+        <button type="button" data-a="provider" data-p="gemini" aria-pressed="${g}">Gemini · free</button>
+        <button type="button" data-a="provider" data-p="claude" aria-pressed="${!g}">Claude · paid</button>
+      </div>
+      <span class="help">${g ? "Google's free tier. Good for trying Capture out." : 'Uses your Claude API credits. Cards use Haiku; questions can use Sonnet.'}</span>
+    </div>
+    <hr class="sep">
+    ${g ? geminiSettingsHTML() : claudeSettingsHTML()}
+    <hr class="sep">
+    <div class="field">
+      <label>Your data</label>
+      <span class="help">Everything lives on this phone. Export it now and then as a backup.</span>
+      <div class="inrow"><button class="btn line" data-a="export" type="button">Export as a file</button>${installPrompt ? `<button class="btn line" data-a="install" type="button">Install on home screen</button>` : ''}</div>
+    </div>
+  </div>`;
+}
+function geminiSettingsHTML() {
+  rollUsage();
+  const f = usage.counts['Flash'] || 0, l = usage.counts['Flash-Lite'] || 0;
+  const k = settings.geminiKey;
+  const masked = k ? k.slice(0, 6) + '…' + k.slice(-4) : '';
+  return `<div class="field">
+      <label for="apikey">Gemini API key</label>
+      ${k ? `<span class="help">Saved on this phone only: <span style="font-family:var(--mono)">${esc(masked)}</span></span>` : ''}
+      <div class="inrow"><input class="input" id="apikey" type="password" autocomplete="off" spellcheck="false" placeholder="${k ? 'Paste a new key to replace it' : 'AIza…'}"><button class="btn" data-a="savekey" type="button">Save &amp; test</button></div>
+      <span class="status" id="keyStatus"></span>
+      ${k && settings.gModels ? `<span class="help">Using ${esc(settings.gModels.flash)}, and ${esc(settings.gModels.lite)} when that one's daily limit runs out.</span>` : ''}
+      ${k ? `<button class="linkbtn" data-a="removekey" type="button" style="align-self:flex-start">Remove key from this phone</button>` : ''}
+    </div>
+    ${k ? '' : `<div class="field"><label>Getting a free key (about 2 minutes)</label>
+      <ol class="steps">
+        <li>Open <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> and sign in with your Google account.</li>
+        <li>Tap <strong>Create API key</strong>. If it asks, let it create a project for you.</li>
+        <li>Copy the key. Don't add billing, so you stay on the free tier and are never charged.</li>
+        <li>Paste it above and tap <strong>Save &amp; test</strong>.</li>
+      </ol></div>`}
+    <div class="field">
+      <label>Used today</label>
+      <div class="spend"><span>${f} on Flash · ${l} on Flash-Lite</span></div>
+      <span class="help">The free tier allows roughly 20 requests a day on Flash and a few hundred on Flash-Lite. Each card is one request, and so is each question. When Flash runs out, Capture moves to Flash-Lite by itself.</span>
+    </div>
+    <div class="field">
+      <label><input type="checkbox" id="geminiSearch" ${settings.geminiSearch ? 'checked' : ''}> Let questions search Google for fresh information</label>
+      <span class="help">The free tier may not allow this. If it doesn't, Capture turns it off and Gemini answers from what it knows.</span>
+    </div>
+    <div class="field">
+      <label>Privacy</label>
+      <span class="help">On the free tier, Google may use what you send to improve its products. Keep private or personal things out of Capture.</span>
+    </div>`;
+}
+function claudeSettingsHTML() {
   rollMonth();
   const pct = settings.cap > 0 ? Math.min(100, spend.usd / settings.cap * 100) : 0;
   const masked = settings.apiKey ? settings.apiKey.slice(0, 10) + '…' + settings.apiKey.slice(-4) : '';
-  return `<div class="form">
+  return `
     <div class="field">
       <label for="apikey">Claude API key</label>
       ${settings.apiKey ? `<span class="help">Saved on this phone only: <span style="font-family:var(--mono)">${esc(masked)}</span></span>` : ''}
@@ -876,14 +1058,7 @@ function settingsHTML() {
     <div class="field">
       <label><input type="checkbox" id="searchCards" ${settings.searchCards ? 'checked' : ''}> Let cards search the web for news and prices</label>
       <span class="help">About 1¢ per search, used only when a thing needs fresh information.</span>
-    </div>
-    <hr class="sep">
-    <div class="field">
-      <label>Your data</label>
-      <span class="help">Everything lives on this phone. Export it now and then as a backup.</span>
-      <div class="inrow"><button class="btn line" data-a="export" type="button">Export as a file</button>${installPrompt ? `<button class="btn line" data-a="install" type="button">Install on home screen</button>` : ''}</div>
-    </div>
-  </div>`;
+    </div>`;
 }
 
 function renderSheet() {
@@ -938,6 +1113,25 @@ async function saveKey() {
   const v = ($('#apikey')?.value || '').trim();
   const st = $('#keyStatus');
   if (!v) { st.className = 'status bad'; st.textContent = 'Paste your key first.'; return; }
+  if (isGemini()) {
+    if (!/^AIza/.test(v)) { st.className = 'status bad'; st.textContent = 'That doesn’t look like a Gemini API key. It starts with AIza.'; return; }
+    st.className = 'status'; st.textContent = 'Testing…';
+    const prev = settings.geminiKey;
+    settings.geminiKey = v;
+    try {
+      settings.gModels = await discoverGemini();
+      await setKV('settings', settings);
+      blocked = null; pausedUntil = 0; clearBanner();
+      st.className = 'status good'; st.textContent = 'Connected. Your things are being explained now.';
+      $('#apikey').value = '';
+      pump();
+      setTimeout(() => { if (sheet?.type === 'settings') { delete $('#sheetBody').dataset.settings; render(); } }, 1200);
+    } catch (e) {
+      settings.geminiKey = prev;
+      st.className = 'status bad'; st.textContent = e?.code === 'bad_key' ? 'Google didn’t accept that key. Copy it again from AI Studio.' : explainError(e);
+    }
+    return;
+  }
   if (!/^sk-ant-/.test(v)) { st.className = 'status bad'; st.textContent = 'That doesn’t look like a Claude API key. It starts with sk-ant-.'; return; }
   st.className = 'status'; st.textContent = 'Testing…';
   const prev = settings.apiKey;
@@ -975,7 +1169,7 @@ $('#captureForm').addEventListener('submit', (e) => {
   if (!v.trim()) return;
   q.value = ''; ctx.value = ''; ctx.hidden = true; keep.disabled = true;
   capture(v, c);
-  toast(settings.apiKey ? "Kept. It's being explained now." : 'Kept. It will be explained once Claude is connected.');
+  toast(hasKey() ? "Kept. It's being explained now." : `Kept. It will be explained once ${aiName()} is connected.`);
 });
 if (SR) { $('#mic').hidden = false; $('#mic').addEventListener('click', toggleMic); }
 
@@ -995,6 +1189,7 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('change', (e) => {
   if (e.target.id === 'cap') { settings.cap = Math.max(0, parseFloat(e.target.value) || 0); setKV('settings', settings); if (blocked === 'cap' && !overCap()) { blocked = null; clearBanner(); pump(); } delete $('#sheetBody').dataset.settings; render(); }
   if (e.target.id === 'searchCards') { settings.searchCards = e.target.checked; setKV('settings', settings); }
+  if (e.target.id === 'geminiSearch') { settings.geminiSearch = e.target.checked; setKV('settings', settings); }
 });
 document.addEventListener('click', (e) => {
   const t = e.target.closest('[data-a],[data-view],[data-range]');
@@ -1013,7 +1208,16 @@ document.addEventListener('click', (e) => {
     case 'continue': return continueInClaude(id);
     case 'settings': return openSheet({type:'settings'});
     case 'savekey': return saveKey();
-    case 'removekey': settings.apiKey = ''; setKV('settings', settings); blocked = 'no_key'; delete $('#sheetBody').dataset.settings; render(); toast('Key removed from this phone.'); return;
+    case 'removekey': if (isGemini()) settings.geminiKey = ''; else settings.apiKey = ''; setKV('settings', settings); blocked = 'no_key'; delete $('#sheetBody').dataset.settings; render(); toast('Key removed from this phone.'); return;
+    case 'provider': {
+      settings.provider = t.dataset.p === 'claude' ? 'claude' : 'gemini';
+      setKV('settings', settings);
+      blocked = null; pausedUntil = 0; clearBanner();
+      if (!hasKey()) blocked = 'no_key';
+      else if (!isGemini() && overCap()) handleBlocking({code:'cap'});
+      delete $('#sheetBody').dataset.settings; render(); pump();
+      return;
+    }
     case 'defmodel': settings.chatModel = t.dataset.m; setKV('settings', settings); delete $('#sheetBody').dataset.settings; render(); return;
     case 'export': return exportData();
     case 'install': if (installPrompt) { installPrompt.prompt(); installPrompt = null; } return;
@@ -1033,12 +1237,13 @@ render();
 (async () => {
   try {
     idb = await openDB();
-    const [its, m, s, sp] = await Promise.all([tx('items', 'readonly', (st) => st.getAll()), getKV('meta'), getKV('settings'), getKV('spend')]);
+    const [its, m, s, sp, us] = await Promise.all([tx('items', 'readonly', (st) => st.getAll()), getKV('meta'), getKV('settings'), getKV('spend'), getKV('usage')]);
     for (const it of its || []) items.set(it.id, it);
     if (m) meta = m;
     if (s) settings = {...settings, ...s};
     if (sp) spend = sp;
-    rollMonth();
+    if (us) usage = us;
+    rollMonth(); rollUsage();
   } catch (e) {
     console.warn(e);
     setBanner("This browser won't let Capture save anything. Open it in Chrome (not a private tab).");
@@ -1053,8 +1258,8 @@ render();
   }
   if (p.has('add')) setTimeout(() => q.focus(), 50);
   if ([...p.keys()].length) history.replaceState(null, '', location.pathname);
-  if (!settings.apiKey) blocked = 'no_key';
-  else if (overCap()) handleBlocking({code:'cap'});
+  if (!hasKey()) blocked = 'no_key';
+  else if (!isGemini() && overCap()) handleBlocking({code:'cap'});
   render();
   maybeFillDrop();
   pump();

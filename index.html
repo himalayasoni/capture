@@ -991,7 +991,7 @@ function geminiSettingsHTML() {
   return `<div class="field">
       <label for="apikey">Gemini API key</label>
       ${k ? `<span class="help">Saved on this phone only: <span style="font-family:var(--mono)">${esc(masked)}</span></span>` : ''}
-      <div class="inrow"><input class="input" id="apikey" type="password" autocomplete="off" spellcheck="false" placeholder="${k ? 'Paste a new key to replace it' : 'AIza…'}"><button class="btn" data-a="savekey" type="button">Save &amp; test</button></div>
+      <div class="inrow"><input class="input" id="apikey" type="password" autocomplete="off" spellcheck="false" placeholder="${k ? 'Paste a new key to replace it' : 'Paste your key'}"><button class="btn" data-a="savekey" type="button">Save &amp; test</button></div>
       <span class="status" id="keyStatus"></span>
       ${k && settings.gModels ? `<span class="help">Using ${esc(settings.gModels.flash)}, and ${esc(settings.gModels.lite)} when that one's daily limit runs out.</span>` : ''}
       ${k ? `<button class="linkbtn" data-a="removekey" type="button" style="align-self:flex-start">Remove key from this phone</button>` : ''}
@@ -1114,7 +1114,7 @@ async function saveKey() {
   const st = $('#keyStatus');
   if (!v) { st.className = 'status bad'; st.textContent = 'Paste your key first.'; return; }
   if (isGemini()) {
-    if (!/^AIza/.test(v)) { st.className = 'status bad'; st.textContent = 'That doesn’t look like a Gemini API key. It starts with AIza.'; return; }
+    if (v.length < 20 || /\s/.test(v)) { st.className = 'status bad'; st.textContent = 'That doesn’t look like a whole Gemini API key. Copy it again from AI Studio.'; return; }
     st.className = 'status'; st.textContent = 'Testing…';
     const prev = settings.geminiKey;
     settings.geminiKey = v;

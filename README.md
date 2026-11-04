@@ -1,6 +1,6 @@
 # Capture
 
-A comfort-first learning jar. Keep any word, topic or thing you hear about; the AI explains it in a line, a minute, or more, and hands back at most three a day. The Shelf shows what you have learned by day, week and month.
+A comfort-first learning jar, sibling to Ledger. Keep any word, topic or thing you hear about with the + button; the AI explains it, and up to three a day come back as big colourful story cards. Swipe right if you got it, left for another day, tap for the full story and to ask questions. Everything you learn collects on the Shelf as stickers.
 
 - Installs on your phone from Chrome (Add to Home screen) and works offline.
 - Share text or links into it from any app (Android share sheet).
